@@ -1,0 +1,103 @@
+#include <Arduino.h>
+#include <Adafruit_TinyUSB.h>
+#include <Adafruit_APDS9960.h>
+
+const uint8_t RING_PIN = 6;
+const uint8_t SERVO_PIN = 9;
+const int PIXELS = 16;
+
+const uint8_t BRIGHTNESS = 204;  // 最大亮度的 80%：255 × 0.8 = 204
+const uint8_t NEAR_LEVEL = 30;   // 手靠近的触发阈值
+const int START_FADE_MS = 1000;  // 第一次从熄灭到亮起，1 秒
+const int HOLD_MS = 3000;        // 每种颜色保持 3 秒
+const int FADE_MS = 800;         // 换色渐变 0.8 秒
+const int STEPS = 50;
+
+const uint8_t off[3] = {0, 0, 0};
+const uint8_t colors[][3] = {
+  {0,          0,          BRIGHTNESS},  // 蓝
+  {BRIGHTNESS, BRIGHTNESS, BRIGHTNESS},  // 白
+  {BRIGHTNESS, 0,          BRIGHTNESS}   // 紫
+};
+
+Adafruit_APDS9960 sensor;
+alignas(4) uint16_t ringBits[PIXELS * 24 + 2];
+
+void setupRing() {
+  pinMode(RING_PIN, OUTPUT);
+  digitalWrite(RING_PIN, LOW);
+
+  NRF_PWM3->ENABLE = 0;
+  NRF_PWM3->PSEL.OUT[0] = g_ADigitalPinMap[RING_PIN];
+  for (int i = 1; i < 4; ++i) {
+    NRF_PWM3->PSEL.OUT[i] = 0xffffffffu;
+  }
+
+  NRF_PWM3->MODE = PWM_MODE_UPDOWN_Up;
+  NRF_PWM3->PRESCALER = PWM_PRESCALER_PRESCALER_DIV_1;
+  NRF_PWM3->COUNTERTOP = 20;
+  NRF_PWM3->DECODER = PWM_DECODER_LOAD_Common;
+  NRF_PWM3->LOOP = 0;
+  NRF_PWM3->SEQ[0].PTR = (uintptr_t)ringBits;
+  NRF_PWM3->SEQ[0].CNT = PIXELS * 24 + 2;
+  NRF_PWM3->SEQ[0].REFRESH = 0;
+  NRF_PWM3->SEQ[0].ENDDELAY = 0;
+  NRF_PWM3->SHORTS = PWM_SHORTS_SEQEND0_STOP_Msk;
+  NRF_PWM3->ENABLE = PWM_ENABLE_ENABLE_Enabled;
+}
+
+void showRing(uint8_t red, uint8_t green, uint8_t blue) {
+  uint32_t grb = ((uint32_t)green << 16) | ((uint32_t)red << 8) | blue;
+
+  for (int pixel = 0; pixel < PIXELS; ++pixel) {
+    for (int bit = 0; bit < 24; ++bit) {
+      bool one = grb & (1UL << (23 - bit));
+      ringBits[pixel * 24 + bit] = 0x8000u | (one ? 13 : 6);
+    }
+  }
+
+  ringBits[PIXELS * 24] = 0x8000u;
+  ringBits[PIXELS * 24 + 1] = 0x8000u;
+  __DMB();
+  NRF_PWM3->TASKS_SEQSTART[0] = 1;
+}
+
+void fadeTo(const uint8_t from[], const uint8_t to[], int durationMs) {
+  for (int step = 1; step <= STEPS; ++step) {
+    uint8_t rgb[3];
+    for (int c = 0; c < 3; ++c) {
+      rgb[c] = (from[c] * (STEPS - step) + to[c] * step + STEPS / 2) / STEPS;
+    }
+    delay(durationMs / STEPS);
+    showRing(rgb[0], rgb[1], rgb[2]);
+  }
+}
+
+void setup() {
+  pinMode(SERVO_PIN, OUTPUT);
+  digitalWrite(SERVO_PIN, LOW);
+
+  setupRing();
+  showRing(0, 0, 0);
+
+  while (!sensor.begin()) delay(1000);
+  sensor.setProxGain(APDS9960_PGAIN_4X);
+  sensor.enableProximity(true);
+
+  // 连续两次检测到手靠近，就启动灯效。
+  int nearSamples = 0;
+  while (nearSamples < 2) {
+    delay(40);
+    if (sensor.readProximity() >= NEAR_LEVEL) ++nearSamples;
+    else nearSamples = 0;
+  }
+
+  fadeTo(off, colors[0], START_FADE_MS);
+}
+
+void loop() {
+  for (int current = 0; current < 3; ++current) {
+    delay(HOLD_MS);
+    fadeTo(colors[current], colors[(current + 1) % 3], FADE_MS);
+  }
+}
